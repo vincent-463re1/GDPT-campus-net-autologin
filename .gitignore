@@ -1,0 +1,12 @@
+# 凭据与运行产物 —— 不要提交
+auth.txt
+*_log.txt
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# 构建目录
+.vs/
+Debug/
+Release/
