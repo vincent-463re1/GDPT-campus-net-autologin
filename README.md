@@ -31,37 +31,20 @@
 ## 关键实现细节
 
 - **无窗口**：PE 子系统设为 Windows GUI，失败时才 `AllocConsole` 弹提示
-- **日志**：`_wfopen_s(..., L"wb")` + `fwrite`，绝不用 `ccs=UTF-8` + `fprintf`（遇中文会 `__fastfail` 崩溃，退出码 `0xC0000409`）
 - **便携**：`auth.txt` 和日志都定位到 exe 自身目录（`GetModuleFileNameW`），整个文件夹可搬走
 - **崩溃可见**：`SetUnhandledExceptionFilter` 把异常码/地址写进日志
 - **超时兜底**：独立线程 watchdog 强制结束，避免卡死
 
-## 编译
-
-需要 MSVC + Windows SDK + C++/WinRT 头文件。
-
-```bat
-cl /nologo /std:c++20 /EHsc /O2 /utf-8 httplogin.cpp ^
-   /I "<SDK目录>\Include\<版本>\cppwinrt" /Fe:httplogin.exe
-
-cl /nologo /std:c++17 /EHsc /O2 /utf-8 campus_ctl.cpp /Fe:校园网控制台.exe
-```
-
-`httplogin.cpp` 必须用 `/std:c++20`（C++/WinRT 依赖 `<coroutine>`，C++17 会 C2338 报错）。
-
 ## 使用
 
-1. 编译出 `httplogin.exe` / `校园网控制台.exe`
-2. 同目录放 `auth.txt`（第 1 行学号，第 2 行密码）
-3. 右键 `install_autostart.bat` -> 以管理员身份运行
+1. 账号密码 `auth.txt`（第 1 行学号，第 2 行密码）
+2. 右键 `安装校园网自动登录.bat` -> 以管理员身份运行
 4. 之后每次登录 Windows 自动认证
 
 ## 注意事项
 
-- `auth.txt` 含明文密码，**不要提交到仓库、不要连同程序一起外发**（`.gitignore` 已排除）
 - 首次跑 bat 时杀毒软件可能拦截（创建计划任务/快捷方式），选允许
 - 门户地址代码里有兜底 `10.110.141.3`，换校区可能要调整
-- 校园网内可能访问不了 GitHub，用手机热点或代理
 
 ## 环境实测数据（某高校有线校园网）
 
