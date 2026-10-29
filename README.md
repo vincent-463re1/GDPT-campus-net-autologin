@@ -56,3 +56,7 @@
 | `www.baidu.com` | http=200 | http=000 —— **可作复检** |
 
 结论：探针要选「掉线时被劫持、联网时不通」的地址；「联网时响应快」是错误的判断标准。
+
+## License
+
+[MIT](LICENSE) © 2026 vincent yang
