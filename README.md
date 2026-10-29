@@ -1,6 +1,7 @@
 # 校园网自动登录 (Campus Net Auto-Login)
 
 锐捷 ePortal 校园网的纯 HTTP 自动认证工具，Windows / C++，无浏览器、无窗口、秒级完成。
+
 旧账号登不上了所以新开了个仓库放更新，如果之后我用着还有啥问题会继续更新，没有就放这了
 原项目仓库：https://github.com/vincent463re/GDPT-Campus-Login
 
