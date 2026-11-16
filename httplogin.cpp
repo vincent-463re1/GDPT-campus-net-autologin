@@ -1,4 +1,4 @@
-// httplogin.cpp (level 1/2 都登录,20秒超时兜底,无控制台窗口, 只写日志)
+// httplogin.cpp (level 1/2 都登录,70秒超时兜底,无控制台窗口, 只写日志)
 // 纯 HTTP 登录校园网 (锐捷 ePortal / RG-SAM+)
 // 日志: 与 exe 同目录的 httplogin_log.txt
 //下面用法是cmd的好像，我没试过，比较懒
@@ -46,6 +46,12 @@ static std::wstring g_pass;
 
 // 日志 (只写文件, 不弹控制台)
 static FILE* g_log = NULL;
+// g_log 会被主线程和看门狗/崩溃处理器同时碰到, 所有访问都过这把锁
+static CRITICAL_SECTION g_logCs;
+static bool g_logCsReady = false;
+static thread_local bool g_inLog = false;   // 崩溃时判断"是不是正卡在 Log 里"
+// 已经得出结论(成功/失败已定)时置位, 看门狗不再改写退出码
+static volatile bool g_done = false;
 
 // 取 exe 自身所在目录 (不含末尾反斜杠) —— 让程序可以整体挪走
 static std::wstring GetExeDir()
@@ -60,6 +66,7 @@ static std::wstring GetExeDir()
 
 static void LogInit()
 {
+    if (!g_logCsReady) { InitializeCriticalSection(&g_logCs); g_logCsReady = true; }
     std::wstring p = GetExeDir() + L"\\httplogin_log.txt";
     _wfopen_s(&g_log, p.c_str(), L"wb");   // 二进制: 避免 ccs=UTF-8 转中文崩溃
 }
@@ -70,7 +77,11 @@ static void Log(const char* fmt, ...)
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (!g_log) return;
+    if (!g_log || !g_logCsReady) return;
+
+    EnterCriticalSection(&g_logCs);
+    if (!g_log) { LeaveCriticalSection(&g_logCs); return; }
+    g_inLog = true;
 
     SYSTEMTIME st; GetLocalTime(&st);
     const char* p = buf;
@@ -84,13 +95,27 @@ static void Log(const char* fmt, ...)
         p = nl + 1;
     }
     fflush(g_log);
+    g_inLog = false;
+    LeaveCriticalSection(&g_logCs);
+}
+
+// 关闭日志（线程安全）: 所有 fclose(g_log) 都改用它
+static void LogClose()
+{
+    if (!g_logCsReady) { if (g_log) { fclose(g_log); g_log = NULL; } return; }
+    EnterCriticalSection(&g_logCs);
+    if (g_log) { fclose(g_log); g_log = NULL; }
+    LeaveCriticalSection(&g_logCs);
 }
 
 // 全局崩溃处理器: 崩溃时把原因写进日志, 避免"程序静默消失、日志莫名中断"
 // 注意: 崩溃时堆可能已损坏, 这里只用最简单的 snprintf + fwrite, 不调用 Log()
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep)
 {
-    if (g_log) {
+    // ① 崩在 Log 内部: 往一个写了一半的 FILE* 里再写只会二次崩溃, 直接放弃
+    // ② 别的线程持锁: TryEnter 拿不到就放弃, 不能死等
+    if (g_inLog) return EXCEPTION_EXECUTE_HANDLER;
+    if (g_log && g_logCsReady && TryEnterCriticalSection(&g_logCs)) {
         DWORD code = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionCode : 0;
         void* addr = (ep && ep->ExceptionRecord) ? ep->ExceptionRecord->ExceptionAddress : nullptr;
         char buf[512];
@@ -105,16 +130,18 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep)
         }
         fclose(g_log);
         g_log = NULL;
+        LeaveCriticalSection(&g_logCs);
     }
     return EXCEPTION_EXECUTE_HANDLER;   // 记完就结束, 不弹系统错误窗
 }
-// 20 秒超时兜底
+// 70 秒超时兜底
 static DWORD WINAPI TimeoutProc(LPVOID)
 {
-    Sleep(20000);
-    Log("\n[超时] 程序运行超过 20 秒, 强制退出\n");
-    if (g_log) { fclose(g_log); g_log = NULL; }
-    ExitProcess(0);
+    Sleep(70000);
+    if (g_done) return 0;               // 已经有结论了, 别再把它改写成超时
+    Log("\n[超时] 程序运行超过 70 秒, 强制退出\n");
+    LogClose();
+    ExitProcess(2);          // 2 = 超时, 不能和 0(成功) 混同
     return 0;
 }
 
@@ -428,7 +455,18 @@ static bool ReadAuthFile(std::wstring& user, std::wstring& pass)
 // 弹一个控制台窗口显示提示, 等按任意键后关闭 (GUI 子系统程序用)
 static void ShowConsoleWait(const wchar_t* msg)
 {
-    if (!AllocConsole()) return;              // 已有关联控制台则不动
+    // 被控制台/计划任务拉起时已有关联控制台, AllocConsole 必然失败。
+    // 这时不能直接 return(否则提示一个字都看不到), 改为写到继承来的控制台, 并且不阻塞。
+    if (!AllocConsole()) {
+        Log("[提示] %ls\n", msg);
+        HANDLE hc = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hc && hc != INVALID_HANDLE_VALUE) {
+            DWORD w = 0;
+            std::wstring line = std::wstring(L"\n  ") + msg + L"\n";
+            WriteConsoleW(hc, line.c_str(), (DWORD)line.size(), &w, NULL);
+        }
+        return;
+    }
     SetConsoleOutputCP(936);                  // 中文
     SetConsoleTitleW(L"校园网自动登录 - 提示");
 
@@ -447,11 +485,153 @@ static void ShowConsoleWait(const wchar_t* msg)
     if (hi && hi != INVALID_HANDLE_VALUE) {
         FlushConsoleInputBuffer(hi);
         INPUT_RECORD rec; DWORD rd = 0;
-        while (ReadConsoleInputW(hi, &rec, 1, &rd)) {
+        for (int i = 0; i < 600; i++) {          // 最多等 60 秒, 不无限挂
+            if (!ReadConsoleInputW(hi, &rec, 1, &rd)) { Sleep(100); continue; }
             if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown) break;
         }
     }
     FreeConsole();
+}
+
+// 前置闸门: 只在本校网络下继续。
+//   有线(非 WiFi)            -> 继续
+//   WiFi 且 SSID = GDPT-Student -> 继续
+//   WiFi 且 SSID 不匹配        -> 退出, 不登录
+//   读不到 SSID / 判断失败     -> 继续(fail-open, 宁可多登一次也不能漏登)
+static bool ShouldRunOnThisNetwork()
+{
+    try
+    {
+        auto profile = winrt::Windows::Networking::Connectivity::NetworkInformation::GetInternetConnectionProfile();
+        if (!profile)
+        {
+            Log("[闸门] 读不到联网网卡 -> 继续尝试登录(fail-open)\n");
+            return true;
+        }
+
+        auto adapter = profile.NetworkAdapter();
+        unsigned int iana = adapter ? (unsigned int)adapter.IanaInterfaceType() : 0;
+        const char* kind = (iana == 71) ? "WiFi" : ((iana == 6) ? "有线" : "其它/未知");
+        Log("[闸门] 网卡类型 IanaInterfaceType = %u (%s)\n", iana, kind);
+
+        if (iana != 71)
+        {
+            Log("[闸门] 不是 WiFi -> 按原有流程登录\n");
+            return true;
+        }
+
+        // WiFi: 读当前连接的 SSID
+        std::wstring ssid;
+        try
+        {
+            auto wlan = profile.WlanConnectionProfileDetails();
+            if (wlan) ssid = std::wstring(wlan.GetConnectedSsid().c_str());
+        }
+        catch (...) { ssid.clear(); }
+
+        if (ssid.empty())
+        {
+            Log("[闸门] 是 WiFi 但读不到 SSID -> 继续尝试登录(fail-open)\n");
+            return true;
+        }
+
+        Log("[闸门] 当前 WiFi SSID = %s\n", ToUtf8(ssid).c_str());
+        if (ssid == L"GDPT-Student")
+        {
+            Log("[闸门] SSID 匹配 -> 走登录流程\n");
+            return true;
+        }
+        Log("[闸门] SSID 不匹配(需要 GDPT-Student) -> 不登录, 直接退出\n");
+        return false;
+    }
+    catch (...)
+    {
+        Log("[闸门] 判断网卡类型时出错 -> 继续尝试登录(fail-open)\n");
+        return true;
+    }
+}
+
+// 拉起保活进程（同目录的 campus_keepalive.exe）。已在跑会被它自己的互斥量挡掉。
+static void LaunchKeepalive()
+{
+    std::wstring p = GetExeDir() + L"\\campus_keepalive.exe";
+    if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        Log("[保活] 同目录没有 campus_keepalive.exe, 跳过\n");
+        return;
+    }
+
+    std::wstring cmd = L"\"" + p + L"\"";
+    std::wstring dir = GetExeDir();
+
+    STARTUPINFOW si = { 0 };
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = { 0 };
+
+    // DETACHED_PROCESS: 完全脱离控制台, 与本进程生命周期无关 (CREATE_NO_WINDOW 与之同用会被忽略)
+    if (CreateProcessW(p.c_str(), cmd.data(), NULL, NULL, FALSE,
+                       DETACHED_PROCESS,
+                       NULL, dir.c_str(), &si, &pi))
+    {
+        Log("[保活] 已拉起 campus_keepalive.exe (PID=%lu)\n", (unsigned long)pi.dwProcessId);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    else
+    {
+        Log("[保活] 拉起失败 err=%lu\n", GetLastError());
+    }
+}
+
+static std::string ExtractUserIndexStr(const std::string& s)
+{
+    size_t p = s.find("userIndex=");
+    if (p == std::string::npos) return "";
+    p += 10;
+    size_t e = s.find_first_of("&#\"' \r\n<>", p);
+    return s.substr(p, (e == std::string::npos) ? std::string::npos : e - p);
+}
+
+// 门户下线（尽力而为）：逐跳拿 userIndex，再 POST logout。
+// 用于"设备未注册"这种会话僵死的情况 —— 先清掉旧会话才能重新登录。
+static bool DoPortalLogout()
+{
+    Log("[重试] 取 userIndex ...\n");
+    std::string userIndex;
+    std::wstring url = L"http://10.110.141.3/";
+
+    // 这段在"网络最不稳定"的时刻执行, 必须用短超时, 否则会把看门狗预算吃穿
+    for (int hop = 0; hop < 3; hop++) {
+        HttpResponse r;
+        if (!HttpRequest(url, L"GET", "", false, L"", r, 800)) break;
+        userIndex = ExtractUserIndexStr(r.location);
+        if (userIndex.empty()) userIndex = ExtractUserIndexStr(r.body);
+        if (!userIndex.empty()) break;
+        if (r.location.empty()) break;
+        url = (r.location.rfind("http", 0) == 0)
+                ? ToW(r.location)
+                : ToW("http://10.110.141.3" + r.location);
+    }
+
+    if (userIndex.empty()) {
+        Log("[重试] 没取到 userIndex（可能确实不在线），直接重登\n");
+        return false;
+    }
+    Log("[重试] userIndex 长度=%d\n", (int)userIndex.size());
+
+    HttpResponse r2;
+    // userIndex 原样发送: 与控制台里已验证可用的写法一致, 不做二次编码
+    HttpRequest(L"http://10.110.141.3/eportal/InterFace.do?method=logout",
+                L"POST", "userIndex=" + userIndex, false, L"", r2, 800);
+    std::string res = JsonStr(r2.body, "result");
+    Log("[重试] 下线 状态=%d result=%s\n", r2.status, res.empty() ? "(无)" : res.c_str());
+    return res == "success";
+}
+
+// 门户提示"已在线"= 会话还有效, 按成功处理, 绝不能去掉线
+static bool IsAlreadyOnline(const std::string& msg)
+{
+    return msg.find("已在线") != std::string::npos
+        || msg.find("已经在线") != std::string::npos;
 }
 
 // 主流程
@@ -459,7 +639,14 @@ int wmain(int argc, wchar_t** argv)
 {
     LogInit();
     SetUnhandledExceptionFilter(CrashHandler);          // 崩溃时写日志
-    CreateThread(NULL, 0, TimeoutProc, NULL, 0, NULL);   // 20 秒兜底
+    CreateThread(NULL, 0, TimeoutProc, NULL, 0, NULL);   // 70 秒兜底
+
+    // 前置闸门: 不是本校网络就直接退出, 不做任何网络请求
+    if (!ShouldRunOnThisNetwork())
+    {
+        LogClose();
+        return 0;
+    }
 
     bool hasCred = false;
     if (argc >= 3) { g_user = argv[1]; g_pass = argv[2]; hasCred = true; }   // 命令行优先
@@ -469,7 +656,7 @@ int wmain(int argc, wchar_t** argv)
         Log("[错误] 未取到账号密码!\n");
         Log("  请在本程序所在目录创建 auth.txt, 第一行写账号, 第二行写密码\n");
         Log("  或用命令行: httplogin.exe <账号> <密码>\n");
-        if (g_log) fclose(g_log);
+        LogClose();
         return 1;
     }
     Log("账号: %s  (密码 %d 位)\n\n", ToUtf8(g_user).c_str(), (int)g_pass.size());
@@ -499,22 +686,16 @@ int wmain(int argc, wchar_t** argv)
         Log("    9.9.9.9 预检: %s\n", reachable ? "可达 (被网关接管)" : "不可达");
 
         if (!reachable) {
-            // 9.9.9.9 不可达 => 判定为"已正常联网"(该地址仅在未认证时才被网关接管)。
-            //
-            // 实测数据(2026-10-09):
-            //   联网: 9.9.9.9 http=000(4秒超时)   | 掉线: 9.9.9.9 http=200 + JS跳转(0.01秒)
-            //   另测 223.5.5.5 在联网(404)和掉线(200)时【都可达】, 因此它无法区分两种状态,
-            //   只能作为参考信息打印, 绝不能拿它单独判定"能上网"。
-            // 复检: 用域名地址确认是否真的能上外网。
-            // 依据实测(2026-10-09): www.baidu.com 联网=200 可连, 掉线=000 连不上,
-            // 而 223.5.5.5 两种状态都可达(联网404/掉线200), 因此只能用前者。
-            Log("    9.9.9.9 不可达 -> 复检公网连通性 (www.baidu.com) ...\n");
-            bool internetOk = QuickTcpProbe("www.baidu.com", 80, 1500);
+            // 9.9.9.9 不可达 => 大概率已正常联网。但单次阴性不能定论,
+            // 再用小米检测点复检一次(它需要 DNS 解析, 未认证时解析就失败, 正是要的信号)。
+            Log("    9.9.9.9 不可达 -> 复检公网连通性 (connect.rom.miui.com) ...\n");
+            bool internetOk = QuickTcpProbe("connect.rom.miui.com", 80, 1500);
             Log("    复检结果: %s\n", internetOk ? "可连 -> 确认网络正常" : "不可连 -> 网络异常");
 
             if (internetOk) {
                 Log("\n[结果] 网络正常, 无需登录\n");
-                if (g_log) fclose(g_log);
+                LaunchKeepalive();
+                LogClose();
                 return 0;
             }
             // 9.9.9.9 与公网都不可达: 网络未就绪或异常。
@@ -560,14 +741,16 @@ int wmain(int argc, wchar_t** argv)
     }
 
     if (r1.location.empty()) {
-        if (netOk)
+        if (netOk) {
             Log("\n[结果] 主动探测确认可正常上网 -> 无需登录\n");
+            LaunchKeepalive();
+        }
         else if (limited)
             Log("\n[结果] 系统判定网络受限, 但多次尝试未拿到门户地址 -> 放弃\n");
         else
             Log("\n[结果] 网络未就绪或异常, 未能确认 -> 放弃\n");
-        if (g_log) fclose(g_log);
-        return 0;
+        LogClose();
+        return 4;                    // 4 = 放弃(没能确认网络状态)
     }
 
     // 2. 门户 URL / queryString
@@ -601,29 +784,71 @@ int wmain(int argc, wchar_t** argv)
                      + "&operatorPwd=&operatorUserId=&validcode="
                      + "&passwordEncrypt=" + std::string(needEncrypt ? "true" : "false");
 
-    Log("\n[3] POST 登录\n");
     std::wstring hdr;
     if (!jsid.empty()) hdr = L"Cookie: JSESSIONID=" + ToW(jsid) + L"\r\n";
     hdr += L"Referer: " + ToW(portalUrl) + L"\r\n";
 
-    HttpResponse r3;
-    HttpRequest(ToW(loginUrl), L"POST", body, false, hdr, r3);
-    Log("    响应状态=%d\n", r3.status);
-    Log("    响应内容: %s\n", r3.body.empty() ? "(空)" : r3.body.c_str());
+    std::string result, message;
+    bool didLogout = false, logoutOk = false;
+    for (int attempt = 1; attempt <= 2; attempt++)
+    {
+        Log("\n[3] POST 登录 (第 %d 次)\n", attempt);
 
-    std::string result = JsonStr(r3.body, "result");
-    std::string message = JsonStr(r3.body, "message");
-    Log("\n[4] result=%s\n", result.empty() ? "(无)" : result.c_str());
-    if (!message.empty()) Log("    message=%s\n", message.c_str());
+        HttpResponse r3;
+        HttpRequest(ToW(loginUrl), L"POST", body, false, hdr, r3);
+        Log("    响应状态=%d\n", r3.status);
+        Log("    响应内容: %s\n", r3.body.empty() ? "(空)" : r3.body.c_str());
 
-    if (result == "success") {
-        Log("\n>>> 登录成功! <<<\n");
-    } else {
-        Log("\n>>> 登录失败 (result=%s) <<<\n", result.empty() ? "(无)" : result.c_str());
-        if (g_log) { fclose(g_log); g_log = NULL; }
-        ShowConsoleWait(L"账号密码错误，请检查重试");
+        result  = JsonStr(r3.body, "result");
+        message = JsonStr(r3.body, "message");
+        Log("\n[4] result=%s\n", result.empty() ? "(无)" : result.c_str());
+        if (!message.empty()) Log("    message=%s\n", message.c_str());
+
+        if (result == "success") break;
+
+        // 先判"已在线": 会话还有效, 算成功, 绝不去做下线(否则把好会话踢掉)
+        if (IsAlreadyOnline(message)) break;
+
+        // "设备未注册" = 长时间没心跳, 会话已被踢但状态残留, 门户拒绝新登录。
+        // 正确做法是先下线把旧会话清掉, 再重登一次 —— 不是报"密码错误"。
+        if (message.find("设备未注册") == std::string::npos) break;
+        if (attempt == 2) break;
+
+        Log("\n[重试] 门户提示\"设备未注册\" -> 会话僵死, 先下线再重登\n");
+        didLogout = true;
+        logoutOk  = DoPortalLogout();
+        if (!logoutOk) Log("[重试] 下线没成功 -> 重登很可能仍被拒\n");
+        Sleep(1000);
     }
 
-    if (g_log) fclose(g_log);
-    return 0;
+    bool ok = (result == "success") || IsAlreadyOnline(message);
+
+    int rc = 0;                      // 退出码: 0=成功/已在线, 3=登录失败
+    if (ok) {
+        Log(result == "success" ? "\n>>> 登录成功! <<<\n"
+                                : "\n>>> 门户提示已在线 -> 按成功处理 <<<\n");
+        g_done = true;
+        LaunchKeepalive();
+    } else if (didLogout && logoutOk) {
+        rc = 3;
+        // 旧会话已经清掉, 但现在人真的离线了 —— 不能说成密码错
+        Log("\n>>> 已下线旧会话, 但重新登录未成功 (result=%s) <<<\n", result.empty() ? "(无)" : result.c_str());
+        LogClose();
+        ShowConsoleWait(L"已清除旧会话，但重新登录失败\n请稍后重试，或打开控制台手动登录");
+    } else {
+        rc = 3;
+        if (didLogout)
+            Log("\n>>> 下线失败, 重登也被拒 -> 会话可能仍僵死 <<<\n");
+        // 门户回了内容但不是 success, 且不是已在线 -> 多半是账号密码问题
+        Log("\n>>> 登录失败 (result=%s) <<<\n", result.empty() ? "(无)" : result.c_str());
+        LogClose();
+        g_done = true;
+        if (result.empty() && message.empty())
+            ShowConsoleWait(L"门户没有返回结果，可能是网络问题\n请检查网络后重试");
+        else
+            ShowConsoleWait(L"账号密码错误，请检查重试");
+    }
+
+    LogClose();
+    return rc;
 }

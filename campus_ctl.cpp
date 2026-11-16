@@ -6,7 +6,9 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <conio.h>
+#include <tlhelp32.h>
 #include <cstdio>
+#include <cstring>
 #include <locale.h>
 #include <string>
 #include <vector>
@@ -223,19 +225,29 @@ static int PollKey()
     return ScanKey();
 }
 // 等待子进程结束; 期间按 0 可强制退出 (中止子进程并立即结束本程序)
-static void WaitChildOrCancel(HANDLE hProc)
+// 返回 true = 子进程自己结束; false = 被我们强杀(超时)
+static bool WaitChildOrCancel(HANDLE hProc)
 {
-    for (int i = 0; i < 300; i++) {          // 最多 30 秒
+    for (int i = 0; i < 900; i++) {          // 最多 90 秒 (必须大于 httplogin 的 70 秒看门狗)
         DWORD w = WaitForSingleObject(hProc, 100);
-        if (w == WAIT_OBJECT_0) return;      // 子进程已结束
+        if (w == WAIT_OBJECT_0) return true; // 子进程自己结束了
+        if (w == WAIT_FAILED) {
+            wprintf(L"\n[错误] 等待子进程失败 (err=%lu)\n", GetLastError());
+            return false;
+        }
         int k = PollKey();
         if (k == '0') {
             wprintf(L"\n[强制退出] 按了 0, 中止并退出\n");
-            TerminateProcess(hProc, 0);
-            ExitProcess(0);
+            TerminateProcess(hProc, 0xDEAD);
+            WaitForSingleObject(hProc, 5000);   // 等它真的死掉, 否则退出码可能还是 259
+            wprintf(L"[注意] 已中止。如果刚才是在重登, 你现在可能处于离线状态\n");
+            ExitProcess(5);                     // 5 = 用户取消, 不能和 0(成功) 混同
         }
     }
-    TerminateProcess(hProc, 0);              // 超时兜底
+    wprintf(L"\n[超时] 90 秒还没结束, 强制中止\n");
+    TerminateProcess(hProc, 0xDEAD);         // 非 0: 被强杀绝不能当成上线成功
+    WaitForSingleObject(hProc, 5000);
+    return false;
 }
 
 // ---------------- 上线 ----------------
@@ -274,15 +286,73 @@ static bool DoLogin()
         wprintf(L"  [错误] 启动失败 (err=%lu)\n", GetLastError());
         return false;
     }
-    WaitChildOrCancel(pi.hProcess);
-    DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
+    bool normal = WaitChildOrCancel(pi.hProcess);
+    DWORD code = 0;
+    BOOL gotCode = GetExitCodeProcess(pi.hProcess, &code);
+    DWORD qerr = gotCode ? 0 : GetLastError();
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    wprintf(L"  [上线] 完成 (退出码=%lu)\n", code);
-    return (code == 0);
+    if (!normal) {
+        wprintf(L"  [上线] 子进程超时被强制结束 -> 判定失败\n");
+        return false;
+    }
+    if (!gotCode) {
+        wprintf(L"  [上线] 取不到子进程退出码 (err=%lu) -> 判定失败\n", qerr);
+        return false;
+    }
+    if (code == 0) {
+        wprintf(L"  [上线] 完成 (退出码=0)\n");
+        return true;
+    }
+
+    // httplogin 退出码: 1=缺账号密码 2=超时 3=登录失败 4=放弃
+    const wchar_t* why = L"未知原因";
+    switch (code) {
+        case 1: why = L"没找到账号密码 (auth.txt 或命令行参数)"; break;
+        case 2: why = L"运行超过 70 秒, 超时"; break;
+        case 3: why = L"登录失败: 账号密码可能不对, 或门户拒绝"; break;
+        case 4: why = L"未能确认网络状态, 已放弃"; break;
+    }
+    wprintf(L"  [上线] 失败 (退出码=%lu) -> %ls\n", code, why);
+    return false;
+}
+
+// 结束所有保活进程（campus_keepalive.exe）。返回结束个数，-1 = 枚举失败
+static int g_deniedKeepalive = 0;      // 因权限打不开的保活进程数
+
+static int KillKeepalive()
+{
+    int killed = 0;
+    g_deniedKeepalive = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return -1;
+
+    PROCESSENTRY32W pe;
+    memset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"campus_keepalive.exe") != 0) continue;
+            HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+            if (!h) { g_deniedKeepalive++; continue; }
+            if (TerminateProcess(h, 0)) {
+                // 等它真的退干净(含互斥量释放), 否则紧接着重拉的新实例会被"已在运行"挡掉
+                DWORD dw = WaitForSingleObject(h, 2000);
+                if (dw != WAIT_OBJECT_0)
+                    wprintf(L"  [保活] 已请求结束 PID=%lu (2 秒内未确认退出)\n", (unsigned long)pe.th32ProcessID);
+                killed++;
+                wprintf(L"  [保活] 已结束 PID=%lu\n", (unsigned long)pe.th32ProcessID);
+            }
+            CloseHandle(h);
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return killed;
 }
 
 // ---------------- 下线 ----------------
-static bool DoLogout()
+// 下线请求本体（不含保活的处理）
+static bool DoLogoutRequest()
 {
     wprintf(L"  [下线] 获取 userIndex ...\n");
     std::string ui = GetUserIndex();
@@ -309,6 +379,29 @@ static bool DoLogout()
     return false;
 }
 
+// 对外入口: 先停保活, 再下线。下线失败时明确告诉用户"保活已经停了"
+static bool DoLogout()
+{
+    int kn = KillKeepalive();
+    if (kn > 0) {
+        wprintf(L"  [下线] 先结束了 %d 个保活进程\n", kn);
+    } else if (kn == 0) {
+        if (g_deniedKeepalive > 0)
+            wprintf(L"  [下线] 有 %d 个保活进程打不开(权限不足), 下线后它可能立刻重登\n", g_deniedKeepalive);
+        else
+            wprintf(L"  [下线] 当前没有保活进程\n");
+    } else {
+        wprintf(L"  [下线] 枚举进程失败, 跳过结束保活\n");
+    }
+
+    bool ok = DoLogoutRequest();
+    if (!ok && kn > 0)
+        wprintf(L"  [下线] 注意: 下线没成功, 但保活已经停了; 需要保活就重新上线\n");
+    else if (!ok && kn < 0)
+        wprintf(L"  [下线] 注意: 没能停掉保活(枚举失败), 保活在跑的话会立刻把会话重新拉起来\n");
+    return ok;
+}
+
 // ---------------- 菜单 ----------------
 int main(int argc, char** argv)
 {
@@ -320,9 +413,15 @@ int main(int argc, char** argv)
     // 支持命令行直接执行: campus_ctl.exe 1|2|3
     if (argc > 1) {
         switch (argv[1][0]) {
-            case '1': DoLogin();  return 0;
-            case '2': DoLogout(); return 0;
-            case '3': DoLogout(); Sleep(1000); DoLogin(); return 0;
+            case '1': return DoLogin() ? 0 : 2;
+            case '2': return DoLogout() ? 0 : 3;
+            case '3': {
+                bool off = DoLogout();
+                if (!off) wprintf(L"  [重登] 下线未成功, 仍在线时重登可能无效\n");
+                Sleep(1000);
+                bool on = DoLogin();
+                return (off && on) ? 0 : 4;
+            }
             default:  wprintf(L"用法: 校园网控制台.exe [1|2|3]   1=上线 2=下线 3=重新登录\n"); return 1;
         }
     }
